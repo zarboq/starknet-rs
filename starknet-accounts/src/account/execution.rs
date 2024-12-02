@@ -7,6 +7,7 @@ use crate::{Call, ExecutionEncoder};
 use starknet_core::{
     crypto::compute_hash_on_elements,
     types::{
+        BlockId, BlockTag,
         BroadcastedInvokeTransaction, BroadcastedInvokeTransactionV1,
         BroadcastedInvokeTransactionV3, BroadcastedTransaction, DataAvailabilityMode, FeeEstimate,
         Felt, InvokeTransactionResult, ResourceBounds, ResourceBoundsMapping, SimulatedTransaction,
@@ -171,6 +172,20 @@ where
                 .map_err(AccountError::Provider)?,
         };
 
+        self.estimate_fee_with_nonce_pending(nonce).await
+    }
+
+    pub async fn estimate_fee_pending(&self) -> Result<FeeEstimate, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
         self.estimate_fee_with_nonce(nonce).await
     }
 
@@ -192,6 +207,25 @@ where
         self.simulate_with_nonce(nonce, skip_validate, skip_fee_charge)
             .await
     }
+
+        /// ! Custom simulate_pending
+        pub async fn simulate_pending(
+            &self,
+            skip_validate: bool,
+            skip_fee_charge: bool,
+        ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+            // Resolves nonce
+            let nonce = match self.nonce {
+                Some(value) => value,
+                None => self
+                    .account
+                    .get_nonce()
+                    .await
+                    .map_err(AccountError::Provider)?,
+            };
+            self.simulate_with_nonce_pending(nonce, skip_validate, skip_fee_charge)
+                .await // ! ----- Custom Method -----
+        }
 
     pub async fn send(&self) -> Result<InvokeTransactionResult, AccountError<A::SignError>> {
         self.prepare().await?.send().await
@@ -269,6 +303,35 @@ where
             .map_err(AccountError::Provider)
     }
 
+    /// ! Custom estimate_fee_with_nonce_pending
+    pub async fn estimate_fee_with_nonce_pending(
+        &self,
+        nonce: Felt,
+    ) -> Result<FeeEstimate, AccountError<A::SignError>> {
+        let prepared = PreparedExecutionV1 {
+            account: self.account,
+            inner: RawExecutionV1 {
+                calls: self.calls.clone(),
+                nonce,
+                max_fee: Felt::ZERO,
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        self.account
+            .provider()
+            .estimate_fee_single(
+                BroadcastedTransaction::Invoke(BroadcastedInvokeTransaction::V1(invoke)),
+                [],
+                BlockId::Tag(BlockTag::Pending),
+            )
+            .await
+            .map_err(AccountError::Provider)
+    }
+
     async fn simulate_with_nonce(
         &self,
         nonce: Felt,
@@ -307,6 +370,46 @@ where
             .await
             .map_err(AccountError::Provider)
     }
+
+    async fn simulate_with_nonce_pending(
+        &self,
+        nonce: Felt,
+        skip_validate: bool,
+        skip_fee_charge: bool,
+    ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+        let prepared = PreparedExecutionV1 {
+            account: self.account,
+            inner: RawExecutionV1 {
+                calls: self.calls.clone(),
+                nonce,
+                max_fee: self.max_fee.unwrap_or_default(),
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        let mut flags = vec![];
+
+        if skip_validate {
+            flags.push(SimulationFlag::SkipValidate);
+        }
+        if skip_fee_charge {
+            flags.push(SimulationFlag::SkipFeeCharge);
+        }
+
+        self.account
+            .provider()
+            .simulate_transaction(
+                BlockId::Tag(BlockTag::Pending),
+                BroadcastedTransaction::Invoke(BroadcastedInvokeTransaction::V1(invoke)),
+                &flags,
+            )
+            .await
+            .map_err(AccountError::Provider)
+    }
+
 }
 
 impl<'a, A> ExecutionV3<'a, A>
