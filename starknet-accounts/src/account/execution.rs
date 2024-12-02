@@ -231,6 +231,10 @@ where
         self.prepare().await?.send().await
     }
 
+    pub async fn send_pending(&self) -> Result<InvokeTransactionResult, AccountError<A::SignError>> {
+        self.prepare_pending().await?.send().await
+    }
+
     async fn prepare(&self) -> Result<PreparedExecutionV1<'a, A>, AccountError<A::SignError>> {
         // Resolves nonce
         let nonce = match self.nonce {
@@ -248,6 +252,50 @@ where
             None => {
                 // Obtain the fee estimate
                 let fee_estimate = self.estimate_fee_with_nonce(nonce).await?;
+                // Convert the overall fee to little-endian bytes
+                let overall_fee_bytes = fee_estimate.overall_fee.to_bytes_le();
+
+                // Check if the remaining bytes after the first 8 are all zeros
+                if overall_fee_bytes.iter().skip(8).any(|&x| x != 0) {
+                    return Err(AccountError::FeeOutOfRange);
+                }
+
+                // Convert the first 8 bytes to u64
+                let overall_fee_u64 =
+                    u64::from_le_bytes(overall_fee_bytes[..8].try_into().unwrap());
+
+                // Perform necessary operations on overall_fee_u64 and convert to f64 then to u64
+                (((overall_fee_u64 as f64) * self.fee_estimate_multiplier) as u64).into()
+            }
+        };
+
+        Ok(PreparedExecutionV1 {
+            account: self.account,
+            inner: RawExecutionV1 {
+                calls: self.calls.clone(),
+                nonce,
+                max_fee,
+            },
+        })
+    }
+
+    async fn prepare_pending(&self) -> Result<PreparedExecutionV1<'a, A>, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
+        // Resolves max_fee
+        let max_fee = match self.max_fee {
+            Some(value) => value,
+            None => {
+                // Obtain the fee estimate
+                let fee_estimate = self.estimate_fee_with_nonce_pending(nonce).await?;
                 // Convert the overall fee to little-endian bytes
                 let overall_fee_bytes = fee_estimate.overall_fee.to_bytes_le();
 
