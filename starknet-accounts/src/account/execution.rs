@@ -5,6 +5,7 @@ use super::{
 use crate::ExecutionEncoder;
 
 use starknet_core::types::{
+    BlockId, BlockTag,
     BroadcastedInvokeTransactionV3, BroadcastedTransaction, Call, DataAvailabilityMode,
     FeeEstimate, Felt, InvokeTransactionResult, ResourceBounds, ResourceBoundsMapping,
     SimulatedTransaction, SimulationFlag, SimulationFlagForEstimateFee,
@@ -169,6 +170,21 @@ where
                 .map_err(AccountError::Provider)?,
         };
 
+        self.estimate_fee_with_nonce_pending(nonce).await
+    }
+
+    /// Estimate fee for a transaction in a pending block from a [`Provider`].
+    pub async fn estimate_fee_pending(&self) -> Result<FeeEstimate, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
         self.estimate_fee_with_nonce(nonce).await
     }
 
@@ -193,9 +209,33 @@ where
             .await
     }
 
+    /// ! Custom simulate_pending
+    pub async fn simulate_pending(
+        &self,
+        skip_validate: bool,
+        skip_fee_charge: bool,
+    ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+        self.simulate_with_nonce_pending(nonce, skip_validate, skip_fee_charge)
+            .await // ! ----- Custom Method -----
+    }
+
     /// Signs and broadcasts the transaction to the network.
     pub async fn send(&self) -> Result<InvokeTransactionResult, AccountError<A::SignError>> {
         self.prepare().await?.send().await
+    }
+
+    /// ! Custom send_pending
+    pub async fn send_pending(&self) -> Result<InvokeTransactionResult, AccountError<A::SignError>> {
+        self.prepare_pending().await?.send().await
     }
 
     async fn prepare(&self) -> Result<PreparedExecutionV3<'a, A>, AccountError<A::SignError>> {
@@ -309,6 +349,117 @@ where
         })
     }
 
+    async fn prepare_pending(&self) -> Result<PreparedExecutionV3<'a, A>, AccountError<A::SignError>> {
+        // Resolves nonce
+        let nonce = match self.nonce {
+            Some(value) => value,
+            None => self
+                .account
+                .get_nonce()
+                .await
+                .map_err(AccountError::Provider)?,
+        };
+
+        // Resolves fee settings
+        let (l1_gas, l1_gas_price, l2_gas, l2_gas_price, l1_data_gas, l1_data_gas_price) = match (
+            self.l1_gas,
+            self.l1_gas_price,
+            self.l2_gas,
+            self.l2_gas_price,
+            self.l1_data_gas,
+            self.l1_data_gas_price,
+        ) {
+            (
+                Some(l1_gas),
+                Some(l1_gas_price),
+                Some(l2_gas),
+                Some(l2_gas_price),
+                Some(l1_data_gas),
+                Some(l1_data_gas_price),
+            ) => (
+                l1_gas,
+                l1_gas_price,
+                l2_gas,
+                l2_gas_price,
+                l1_data_gas,
+                l1_data_gas_price,
+            ),
+            (Some(l1_gas), _, Some(l2_gas), _, Some(l1_data_gas), _) => {
+                // When all `gas` fields are specified, we only need the gas prices in FRI. By
+                // specifying all gas values, the user might be trying to avoid a full fee
+                // estimation (e.g. flaky dependencies), so it's inappropriate to call
+                // `estimate_fee` here.
+
+                // This is the lightest-weight block we can get
+                let block = self
+                    .account
+                    .provider()
+                    .get_block_with_tx_hashes(BlockId::Tag(BlockTag::PreConfirmed))
+                    .await
+                    .map_err(AccountError::Provider)?;
+                let block_l1_gas_price = block.l1_gas_price().price_in_fri;
+                let block_l2_gas_price = block.l2_gas_price().price_in_fri;
+                let block_l1_data_gas_price = block.l1_data_gas_price().price_in_fri;
+
+                let adjusted_l1_gas_price =
+                    ((TryInto::<u64>::try_into(block_l1_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128;
+                let adjusted_l2_gas_price =
+                    ((TryInto::<u64>::try_into(block_l2_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128;
+                let adjusted_l1_data_gas_price =
+                    ((TryInto::<u64>::try_into(block_l1_data_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128;
+
+                (
+                    l1_gas,
+                    adjusted_l1_gas_price,
+                    l2_gas,
+                    adjusted_l2_gas_price,
+                    l1_data_gas,
+                    adjusted_l1_data_gas_price,
+                )
+            }
+            // We have to perform fee estimation as long as gas is not specified
+            _ => {
+                let fee_estimate = self.estimate_fee_with_nonce(nonce).await?;
+
+                (
+                    ((fee_estimate.l1_gas_consumed as f64) * self.gas_estimate_multiplier) as u64,
+                    ((TryInto::<u64>::try_into(fee_estimate.l1_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128,
+                    ((fee_estimate.l2_gas_consumed as f64) * self.gas_estimate_multiplier) as u64,
+                    ((TryInto::<u64>::try_into(fee_estimate.l2_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128,
+                    ((fee_estimate.l1_data_gas_consumed as f64) * self.gas_estimate_multiplier)
+                        as u64,
+                    ((TryInto::<u64>::try_into(fee_estimate.l1_data_gas_price)
+                        .map_err(|_| AccountError::FeeOutOfRange)? as f64)
+                        * self.gas_price_estimate_multiplier) as u128,
+                )
+            }
+        };
+
+        Ok(PreparedExecutionV3 {
+            account: self.account,
+            inner: RawExecutionV3 {
+                calls: self.calls.clone(),
+                nonce,
+                l1_gas,
+                l1_gas_price,
+                l2_gas,
+                l2_gas_price,
+                l1_data_gas,
+                l1_data_gas_price,
+            },
+        })
+    }
+
     async fn estimate_fee_with_nonce(
         &self,
         nonce: Felt,
@@ -351,6 +502,50 @@ where
             .await
             .map_err(AccountError::Provider)
     }
+
+        /// ! Custom estimate_fee_with_nonce_pending
+        pub async fn estimate_fee_with_nonce_pending(
+            &self,
+            nonce: Felt,
+        ) -> Result<FeeEstimate, AccountError<A::SignError>> {
+            let skip_signature = self
+            .account
+            .is_signer_interactive(SignerInteractivityContext::Execution { calls: &self.calls });
+
+        let prepared = PreparedExecutionV3 {
+            account: self.account,
+            inner: RawExecutionV3 {
+                calls: self.calls.clone(),
+                nonce,
+                l1_gas: 0,
+                l1_gas_price: 0,
+                l2_gas: 0,
+                l2_gas_price: 0,
+                l1_data_gas: 0,
+                l1_data_gas_price: 0,
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true, skip_signature)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        self.account
+            .provider()
+            .estimate_fee_single(
+                BroadcastedTransaction::Invoke(invoke),
+                if skip_signature {
+                    // Validation would fail since real signature was not requested
+                    vec![SimulationFlagForEstimateFee::SkipValidate]
+                } else {
+                    // With the correct signature in place, run validation for accurate results
+                    vec![]
+                },
+                BlockId::Tag(BlockTag::PreConfirmed),
+            )
+            .await
+            .map_err(AccountError::Provider)
+        }
 
     async fn simulate_with_nonce(
         &self,
@@ -402,6 +597,63 @@ where
             .provider()
             .simulate_transaction(
                 self.account.block_id(),
+                BroadcastedTransaction::Invoke(invoke),
+                &flags,
+            )
+            .await
+            .map_err(AccountError::Provider)
+    }
+
+    async fn simulate_with_nonce_pending(
+        &self,
+        nonce: Felt,
+        skip_validate: bool,
+        skip_fee_charge: bool,
+    ) -> Result<SimulatedTransaction, AccountError<A::SignError>> {
+        let skip_signature = if self
+            .account
+            .is_signer_interactive(SignerInteractivityContext::Execution { calls: &self.calls })
+        {
+            // If signer is interactive, we would try to minimize signing requests. However, if the
+            // caller has decided to not skip validation, it's best we still request a real
+            // signature, as otherwise the simulation would most likely fail.
+            skip_validate
+        } else {
+            // Signing with non-interactive signers is cheap so always request signatures.
+            false
+        };
+
+        let prepared = PreparedExecutionV3 {
+            account: self.account,
+            inner: RawExecutionV3 {
+                calls: self.calls.clone(),
+                nonce,
+                l1_gas: self.l1_gas.unwrap_or_default(),
+                l1_gas_price: self.l1_gas_price.unwrap_or_default(),
+                l2_gas: self.l2_gas.unwrap_or_default(),
+                l2_gas_price: self.l2_gas_price.unwrap_or_default(),
+                l1_data_gas: self.l1_data_gas.unwrap_or_default(),
+                l1_data_gas_price: self.l1_data_gas_price.unwrap_or_default(),
+            },
+        };
+        let invoke = prepared
+            .get_invoke_request(true, skip_signature)
+            .await
+            .map_err(AccountError::Signing)?;
+
+        let mut flags = vec![];
+
+        if skip_validate {
+            flags.push(SimulationFlag::SkipValidate);
+        }
+        if skip_fee_charge {
+            flags.push(SimulationFlag::SkipFeeCharge);
+        }
+
+        self.account
+            .provider()
+            .simulate_transaction(
+                BlockId::Tag(BlockTag::PreConfirmed),
                 BroadcastedTransaction::Invoke(invoke),
                 &flags,
             )
